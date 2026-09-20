@@ -1,0 +1,105 @@
+name: Build Standoff 2 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: yes | sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build unsigned APK
+        run: gradle :app:assembleRelease --no-daemon
+
+      - name: Set APK size and sign
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_BYTES=2750000000
+          SIGNING_RESERVE=262144
+          BASE_APK="$GITHUB_WORKSPACE/app/build/outputs/apk/release/app-release-unsigned.apk"
+          FINAL_APK="$GITHUB_WORKSPACE/Standoff-2.apk"
+          PADDING_DIR="$RUNNER_TEMP/standoff-padding"
+          KEYSTORE="$RUNNER_TEMP/standoff2.jks"
+
+          cp "$BASE_APK" "$FINAL_APK"
+          BASE_BYTES=$(stat -c%s "$FINAL_APK")
+          PADDING_BYTES=$((TARGET_BYTES - BASE_BYTES - SIGNING_RESERVE))
+
+          if [ "$PADDING_BYTES" -le 0 ]; then
+            echo "Base APK is already larger than the target size."
+            exit 1
+          fi
+
+          mkdir -p "$PADDING_DIR/assets"
+          truncate -s "$PADDING_BYTES" "$PADDING_DIR/assets/payload.bin"
+          (
+            cd "$PADDING_DIR"
+            zip -0 -q "$FINAL_APK" assets/payload.bin
+          )
+
+          keytool -genkeypair \
+            -keystore "$KEYSTORE" \
+            -storepass android \
+            -keypass android \
+            -alias standoff2 \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Standoff 2, OU=Mint, O=Mint, L=Moscow, S=Moscow, C=RU"
+
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign \
+            --ks "$KEYSTORE" \
+            --ks-key-alias standoff2 \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            "$FINAL_APK"
+
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$FINAL_APK"
+
+          ACTUAL_BYTES=$(stat -c%s "$FINAL_APK")
+          DIFFERENCE=$((ACTUAL_BYTES - TARGET_BYTES))
+          if [ "$DIFFERENCE" -lt 0 ]; then
+            DIFFERENCE=$((-DIFFERENCE))
+          fi
+
+          echo "Final APK size: $ACTUAL_BYTES bytes"
+          if [ "$DIFFERENCE" -gt 2000000 ]; then
+            echo "Final APK differs from 2.75 GB by more than 2 MB."
+            exit 1
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Standoff-2-APK
+          path: Standoff-2.apk
+          compression-level: 9
